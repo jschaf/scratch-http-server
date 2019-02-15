@@ -36,6 +36,14 @@ func logHandler(w responseWriter, r *request) {
 	io.WriteString(w, "<h1>hello</h1>")
 }
 
+func notFoundHandler(w responseWriter, r *request) {
+	io.WriteString(w, "HTTP/1.0 404 Not Found\r\n"+
+		"Content-Type: text/plain; charset=utf-8\r\n"+
+		"Content-Length: 0\r\n"+
+		"Connection: close\r\n"+
+		"\r\n")
+}
+
 // The HandlerFunc type is an adapter to allow the use of
 // ordinary functions as HTTP handlers. If f is a function
 // with the appropriate signature, HandlerFunc(f) is a
@@ -49,6 +57,8 @@ func handle(pattern string, handler handlerFunc) {
 }
 
 func findHandler(r *request) (handlerFunc, error) {
+	var h handlerFunc = nil
+	var l = 0
 	for k, v := range defaultServeMux {
 		// Bunch of ignored bugs here.
 		//   - duplicate paths
@@ -56,15 +66,17 @@ func findHandler(r *request) (handlerFunc, error) {
 		//   - matching longest prefix
 		if strings.HasPrefix(r.uri, k) {
 			log.Printf("Found handler %s that matched uri: %s", k, r.uri)
-			return v, nil
+
+			if len(k) > l {
+				l = len(k)
+				h = v
+			}
 		}
 	}
-	return nil, errors.New("no handler for path: " + r.uri)
-}
-
-func notFoundHandler(w responseWriter, r *request) {
-	const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
-	_, _ = w.Write([]byte("HTTP/1.0 404 Not Found" + errorHeaders))
+	if h == nil {
+		return nil, errors.New("no handler for path: " + r.uri)
+	}
+	return h, nil
 }
 
 type header map[string][]string
@@ -102,8 +114,7 @@ func readRequest(c *net.Conn) (*request, error) {
 		}
 	}
 
-	if req.method == "GET" {
-		// No body for GET
+	if req.method == "GET" || req.method == "HEAD" {
 		return req, nil
 	}
 
