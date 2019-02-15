@@ -16,8 +16,37 @@ import (
 	"log"
 	"net"
 	"net/textproto"
+	"os"
 	"strings"
+	"syscall"
 )
+
+// netFD is a file descriptor.
+type netFD struct {
+	// System file descriptor.
+	Sysfd int
+}
+
+func (fd *netFD) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n, err := syscall.Read(fd.Sysfd, p)
+	if err != nil {
+		n = 0
+	}
+	return n, err
+}
+
+func (fd *netFD) Write(p []byte) (int, error) {
+	n, err := syscall.Write(fd.Sysfd, p)
+	if err != nil {
+		n = 0
+	}
+	return n, err
+}
+
+// Implement Read and Write
 
 type responseWriter struct {
 	c *net.Conn
@@ -126,13 +155,85 @@ func readRequest(c *net.Conn) (*request, error) {
 	return req, nil
 }
 
+func newNetFD(ip net.IP, port int) (*netFD, error) {
+	syscall.ForkLock.Lock()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, os.NewSyscallError("socket", err)
+	}
+
+	if err = syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(fd)
+		return nil, os.NewSyscallError("setnonblock", err)
+	}
+
+	// Allow broadcast
+	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+		syscall.Close(fd)
+		return nil, os.NewSyscallError("setsockopt", err)
+	}
+	syscall.ForkLock.Unlock()
+
+	// Allow reuse of recently-used addresses.
+	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		syscall.Close(fd)
+		return nil, os.NewSyscallError("setsockopt", err)
+	}
+
+	sa := &syscall.SockaddrInet4{Port: port}
+	copy(sa.Addr[:], ip)
+
+	if err = syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+		return nil, os.NewSyscallError("listen", err)
+	}
+
+	return &netFD{Sysfd: fd}, nil
+}
+
 func main() {
 
 	handle("/", handlerFunc(logHandler))
 	handle("/notfound", handlerFunc(notFoundHandler))
 
-	addr := "127.0.0.1:8080"
-	ln, _ := net.Listen("tcp", addr)
+	host, port := "127.0.0.1", 8080
+
+	// socket returns a network file descriptor that is ready for
+	// asynchronous I/O using the network poller.
+	syscall.ForkLock.Lock()
+	// SYS_SOCKET(domain=2, typ=1, proto=0)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		panic(os.NewSyscallError("socket", err))
+	}
+	if err = syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(fd)
+		panic(os.NewSyscallError("setnonblock", err))
+	}
+
+	// Allow broadcast
+	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+		syscall.Close(fd)
+		panic(os.NewSyscallError("setsockopt", err))
+	}
+	syscall.ForkLock.Unlock()
+
+	// Allow reuse of recently-used addresses.
+	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		syscall.Close(fd)
+		panic(os.NewSyscallError("setsockopt", err))
+	}
+
+	ip := net.IPv4(127, 0, 0, 1)
+	sa := &syscall.SockaddrInet4{Port: port}
+	copy(sa.Addr[:], ip)
+
+	if err = syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+		panic(os.NewSyscallError("listen", err))
+	}
+
+	lsa, _ := syscall.Getsockname(fd)
+
+	//ln, _ := net.Listen("tcp", addr)
 	ln = ln.(*net.TCPListener)
 
 	log.Print("===============")
