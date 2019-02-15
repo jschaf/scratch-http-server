@@ -27,7 +27,7 @@ type netFD struct {
 	Sysfd int
 }
 
-func (fd *netFD) Read(p []byte) (int, error) {
+func (fd netFD) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -38,7 +38,7 @@ func (fd *netFD) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (fd *netFD) Write(p []byte) (int, error) {
+func (fd netFD) Write(p []byte) (int, error) {
 	n, err := syscall.Write(fd.Sysfd, p)
 	if err != nil {
 		n = 0
@@ -46,10 +46,23 @@ func (fd *netFD) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Implement Read and Write
+func (fd *netFD) Accept() (*netFD, error) {
+	nfd, _, err := syscall.Accept(fd.Sysfd)
+	if err == nil {
+		syscall.CloseOnExec(nfd)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &netFD{nfd}, nil
+}
+
+func (fd *netFD) Close() error {
+	return syscall.Close(fd.Sysfd)
+}
 
 type responseWriter struct {
-	c *net.Conn
+	c *netFD
 }
 
 func (w responseWriter) Write(b []byte) (int, error) {
@@ -119,7 +132,7 @@ type request struct {
 	ctx    context.Context
 }
 
-func readRequest(c *net.Conn) (*request, error) {
+func readRequest(c *netFD) (*request, error) {
 	b := bufio.NewReader(*c)
 	tp := textproto.NewReader(b)
 	req := new(request)
@@ -143,6 +156,7 @@ func readRequest(c *net.Conn) (*request, error) {
 		}
 	}
 
+	// Parse body
 	if req.method == "GET" || req.method == "HEAD" {
 		return req, nil
 	}
@@ -156,21 +170,11 @@ func readRequest(c *net.Conn) (*request, error) {
 }
 
 func newNetFD(ip net.IP, port int) (*netFD, error) {
+	// socket syscall doesn't block so use ForkLock
 	syscall.ForkLock.Lock()
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, os.NewSyscallError("socket", err)
-	}
-
-	if err = syscall.SetNonblock(fd, true); err != nil {
-		syscall.Close(fd)
-		return nil, os.NewSyscallError("setnonblock", err)
-	}
-
-	// Allow broadcast
-	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
-		syscall.Close(fd)
-		return nil, os.NewSyscallError("setsockopt", err)
 	}
 	syscall.ForkLock.Unlock()
 
@@ -183,6 +187,12 @@ func newNetFD(ip net.IP, port int) (*netFD, error) {
 	sa := &syscall.SockaddrInet4{Port: port}
 	copy(sa.Addr[:], ip)
 
+	// Bind the socket to a port
+	if err = syscall.Bind(fd, sa); err != nil {
+		return nil, os.NewSyscallError("bind", err)
+	}
+
+	// Listen for incoming connections.
 	if err = syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
 		return nil, os.NewSyscallError("listen", err)
 	}
@@ -195,57 +205,25 @@ func main() {
 	handle("/", handlerFunc(logHandler))
 	handle("/notfound", handlerFunc(notFoundHandler))
 
-	host, port := "127.0.0.1", 8080
-
-	// socket returns a network file descriptor that is ready for
-	// asynchronous I/O using the network poller.
-	syscall.ForkLock.Lock()
-	// SYS_SOCKET(domain=2, typ=1, proto=0)
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		panic(os.NewSyscallError("socket", err))
-	}
-	if err = syscall.SetNonblock(fd, true); err != nil {
-		syscall.Close(fd)
-		panic(os.NewSyscallError("setnonblock", err))
-	}
-
-	// Allow broadcast
-	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
-		syscall.Close(fd)
-		panic(os.NewSyscallError("setsockopt", err))
-	}
-	syscall.ForkLock.Unlock()
-
-	// Allow reuse of recently-used addresses.
-	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-		syscall.Close(fd)
-		panic(os.NewSyscallError("setsockopt", err))
-	}
-
 	ip := net.IPv4(127, 0, 0, 1)
-	sa := &syscall.SockaddrInet4{Port: port}
-	copy(sa.Addr[:], ip)
-
-	if err = syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
-		panic(os.NewSyscallError("listen", err))
+	port := 8080
+	fd, err := newNetFD(ip, port)
+	defer fd.Close()
+	if err != nil {
+		panic(err)
 	}
-
-	lsa, _ := syscall.Getsockname(fd)
-
-	//ln, _ := net.Listen("tcp", addr)
-	ln = ln.(*net.TCPListener)
 
 	log.Print("===============")
 	log.Print("Server Started!")
 	log.Print("===============")
 	log.Print("")
-	log.Print("addr: http://" + addr)
+	log.Printf("addr: http://%s:%d", ip, port)
 
 	for {
 		// Initialize connection
-		rw, e := ln.Accept()
-		c := &rw
+		//rw, e := ln.Accept()
+		rw, e := fd.Accept()
+		c := rw
 		log.Print()
 		log.Print()
 		log.Print("incoming connection")
