@@ -1,14 +1,15 @@
 package main
 
+// Simple, single-threaded server using system calls instead of the net library.
+//
 // Omitted features from the go net package:
 //
-// - Expect 100 Continue support
 // - TLS
 // - Most error checking
 // - Only supports bodies that close, no persistent or chunked connections
 // - Redirects
-// - Context including deadline and cancellation
-// - Uses blocking sockets instead of non-blocking
+// - Deadlines and cancellation
+// - Non-blocking sockets
 
 import (
 	"bufio"
@@ -25,7 +26,7 @@ import (
 	"syscall"
 )
 
-// netSocket is a file descriptor for a socket.
+// netSocket is a file descriptor for a system socket.
 type netSocket struct {
 	// System file descriptor.
 	fd int
@@ -50,6 +51,7 @@ func (ns netSocket) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Creates a new netSocket for the next pending connection request.
 func (ns *netSocket) Accept() (*netSocket, error) {
 	// syscall.ForkLock doc states lock not needed for blocking accept.
 	nfd, _, err := syscall.Accept(ns.fd)
@@ -64,15 +66,6 @@ func (ns *netSocket) Accept() (*netSocket, error) {
 
 func (ns *netSocket) Close() error {
 	return syscall.Close(ns.fd)
-}
-
-type responseWriter struct {
-	ns *netSocket
-}
-
-func (w responseWriter) Write(b []byte) (int, error) {
-	log.Print("writing: " + string(b))
-	return (*w.ns).Write(b)
 }
 
 // Creates a new socket file descriptor, binds it and listens on it.
@@ -110,8 +103,18 @@ func newNetSocket(ip net.IP, port int) (*netSocket, error) {
 	return &netSocket{fd: fd}, nil
 }
 
+// Facade in front of netSocket for nicer types and to log writes.
+type responseWriter struct {
+	ns *netSocket
+}
+
+func (w responseWriter) Write(b []byte) (int, error) {
+	log.Print("writing: " + string(b))
+	return (*w.ns).Write(b)
+}
+
 // Type adapter to allow use of ordinary functions as handlers.
-type handlerFunc func(responseWriter, *request)
+type handlerFunc func(responseWriter, *request) error
 
 type serveMux map[string]handlerFunc
 
@@ -141,32 +144,34 @@ func (m serveMux) findHandler(r *request) (handlerFunc, error) {
 	return h, nil
 }
 
+// Writes the response using the handler that best matches the request.
 func (m serveMux) dispatch(w responseWriter, r *request) error {
 	h, err := m.findHandler(r)
 	if err != nil {
 		return err
 	}
-	h(w, r)
-	return nil
+	return h(w, r)
 }
 
 func writeHtml(f func(*request) string) handlerFunc {
-	return func(w responseWriter, r *request) {
+	return func(w responseWriter, r *request) error {
 		html := f(r)
 		io.WriteString(w, "HTTP/1.0 200 OK\r\n")
 		io.WriteString(w, "Content-Type: text/html; charset=utf-8\r\n")
 		fmt.Fprintf(w, "Content-Length: %d\r\n", len(html))
 		io.WriteString(w, "\r\n")
 		io.WriteString(w, html)
+		return nil
 	}
 }
 
-func notFound(w responseWriter, r *request) {
-	io.WriteString(w, "HTTP/1.0 404 Not Found\r\n"+
+func notFound(w responseWriter, r *request) error {
+	_, err := io.WriteString(w, "HTTP/1.0 404 Not Found\r\n"+
 		"Content-Type: text/plain; charset=utf-8\r\n"+
 		"Content-Length: 0\r\n"+
 		"Connection: close\r\n"+
 		"\r\n")
+	return err
 }
 
 type request struct {
